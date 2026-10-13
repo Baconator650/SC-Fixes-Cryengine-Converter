@@ -21,7 +21,7 @@ public enum IvoPositionFormat : byte
     /// <summary>SNORM with 24-byte header, all channels present (6 bytes per key).</summary>
     SNormFull = 0xC1,
 
-    /// <summary>SNORM with 24-byte header, packed active channels only.</summary>
+    /// <summary>24-byte scale/offset header and separate u16 arrays for active axes.</summary>
     SNormPacked = 0xC2
 }
 
@@ -53,7 +53,7 @@ public static class IvoAnimationHelpers
 
     /// <summary>
     /// Gets the time format from format flags (low nibble).
-    /// 0x00 = ubyte time array, 0x02 = uint16 time with 8-byte header.
+    /// 0x00 = byte times, 0x01 = ushort times, 0x02 = start/end plus keyframe bitmap.
     /// </summary>
     public static byte GetTimeFormat(ushort formatFlags) => (byte)(formatFlags & 0x0F);
 
@@ -92,28 +92,33 @@ public static class IvoAnimationHelpers
             for (int t = 0; t < count; t++)
                 times.Add(b.ReadByte());
         }
-        else
+        else if (timeFormat == 0x01)
         {
-            // 0x42: 8-byte time header (startTime uint16, endTime uint16, marker uint32)
+            for (int t = 0; t < count; t++)
+                times.Add(b.ReadUInt16());
+        }
+        else if (timeFormat == 0x02)
+        {
+            // Start/end frame numbers followed by an LSB-first bitmap.
+            // Each set bit identifies one key, in the order of the value array.
             ushort startTime = b.ReadUInt16();
             ushort endTime = b.ReadUInt16();
-            b.ReadUInt32(); // marker
-
-            // For single-key animations, just use start time
-            if (count == 1)
+            if (endTime < startTime)
+                throw new InvalidDataException("IVO keyframe bitmap has a reversed frame range.");
+            int frameCount = endTime - startTime + 1;
+            var bitmap = b.ReadBytes((frameCount + 7) / 8);
+            if (bitmap.Length != (frameCount + 7) / 8)
+                throw new EndOfStreamException("Truncated IVO keyframe bitmap.");
+            for (int frame = 0; frame < frameCount; frame++)
             {
-                times.Add(startTime);
+                if ((bitmap[frame / 8] & (1 << (frame % 8))) != 0)
+                    times.Add(startTime + frame);
             }
-            else
-            {
-                // Interpolate times between start and end
-                for (int t = 0; t < count; t++)
-                {
-                    float normalized = count > 1 ? (float)t / (count - 1) : 0;
-                    times.Add(startTime + normalized * (endTime - startTime));
-                }
-            }
+            if (times.Count != count)
+                throw new InvalidDataException($"IVO keyframe bitmap contains {times.Count} keys; expected {count}.");
         }
+        else
+            throw new InvalidDataException($"Unsupported IVO key time format 0x{timeFormat:X2}.");
 
         return times;
     }
@@ -199,7 +204,7 @@ public static class IvoAnimationHelpers
 
             case IvoPositionFormat.SNormPacked:
                 // 0xC2xx: 24-byte header followed by 2 bytes per active axis per key,
-                // interleaved (verified empirically vs StarBreaker hex dump).
+                // planar: all X keys, then all Y keys, then all Z keys.
                 // Header layout: [scale Vec3, offset Vec3]. Inactive axes use FLT_MAX
                 // sentinel in the scale field; their value is just `offset` for every key.
                 {
@@ -210,14 +215,11 @@ public static class IvoAnimationHelpers
                     bool yActive = IsChannelActive(scale.Y);
                     bool zActive = IsChannelActive(scale.Z);
 
+                    float[] xs = ReadPositionAxis(b, count, xActive, scale.X, offset.X);
+                    float[] ys = ReadPositionAxis(b, count, yActive, scale.Y, offset.Y);
+                    float[] zs = ReadPositionAxis(b, count, zActive, scale.Z, offset.Z);
                     for (int i = 0; i < count; i++)
-                    {
-                        float x = xActive ? DecompressSNorm(b.ReadUInt16(), scale.X, offset.X) : offset.X;
-                        float y = yActive ? DecompressSNorm(b.ReadUInt16(), scale.Y, offset.Y) : offset.Y;
-                        float z = zActive ? DecompressSNorm(b.ReadUInt16(), scale.Z, offset.Z) : offset.Z;
-
-                        positions.Add(new Vector3(x, y, z));
-                    }
+                        positions.Add(new Vector3(xs[i], ys[i], zs[i]));
                 }
                 break;
 
@@ -238,6 +240,14 @@ public static class IvoAnimationHelpers
         float y = b.ReadSingle();
         float z = b.ReadSingle();
         return new Vector3(x, y, z);
+    }
+
+    private static float[] ReadPositionAxis(BinaryReader b, int count, bool active, float scale, float offset)
+    {
+        var values = new float[count];
+        for (int i = 0; i < count; i++)
+            values[i] = active ? DecompressSNorm(b.ReadUInt16(), scale, offset) : offset;
+        return values;
     }
 }
 
@@ -265,12 +275,10 @@ public struct IvoAnimBlockHeader
 /// All offsets are relative to the START of this controller entry (not the keyframe data start).
 /// </summary>
 /// <remarks>
-/// Format flags breakdown (low nibble determines time format: 0=ubyte, 2=uint16 header):
-/// - Rotation: 0x8040 = ubyte time array, uncompressed quaternions
-///             0x8042 = uint16 time header (8 bytes), uncompressed quaternions
-/// - Position: 0xC040 = ubyte time, numPosKeys positions
-///             0xC142 = uint16 time header (8 bytes), 2 positions
-///             0xC242 = uint16 time header (8 bytes), data header (8 bytes), 1 position
+/// Low nibble: 0=byte times, 1=ushort times, 2=start/end and LSB-first key bitmap.
+/// High byte: rotation 0x80=float quaternion, 0x82=compressed quaternion;
+/// position 0xC0=float3, 0xC1=interleaved u16 XYZ, 0xC2=planar active-axis arrays.
+/// C1/C2 positions have a 24-byte scale/offset header.
 ///             0x0000 = no position track
 /// </remarks>
 public struct IvoAnimControllerEntry
